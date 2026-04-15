@@ -9,47 +9,87 @@ import os
 # =========================
 # CONFIG
 # =========================
-IMG_SIZE = 320
-CLASS_NAMES = ["defective", "good"]
+BASELINE_SIZE = 224
+HYPERTUNED_SIZE = 320
 BASE_DIR = os.path.dirname(__file__)
 
+# Speed optimization
+tf.config.run_functions_eagerly(False)
+
+# =========================
+# LOAD MODELS (CACHED + WARMED UP)
+# =========================
 @st.cache_resource
 def load_models():
-    print("Files in directory:", os.listdir(BASE_DIR))  # debug
+    print("Files in directory:", os.listdir(BASE_DIR))
 
-    baseline = tf.keras.models.load_model(os.path.join(BASE_DIR, "baseModel.keras"))
-    hypertuned = tf.keras.models.load_model(os.path.join(BASE_DIR, "bestModel.keras"))
-    yolo = YOLO(os.path.join(BASE_DIR, "yoloToh.pt"))  # ✅ correct filename
+    baseline = tf.keras.models.load_model(
+        os.path.join(BASE_DIR, "baseModel.keras")
+    )
+
+    hypertuned = tf.keras.models.load_model(
+        os.path.join(BASE_DIR, "bestModel.keras")
+    )
+
+    yolo = YOLO(os.path.join(BASE_DIR, "yoloToh.pt"))
+
+    # 🔥 warm-up (removes first-run lag)
+    baseline_dummy = np.zeros((1, BASELINE_SIZE, BASELINE_SIZE, 3), dtype=np.float32)
+    hypertuned_dummy = np.zeros((1, HYPERTUNED_SIZE, HYPERTUNED_SIZE, 3), dtype=np.float32)
+
+    baseline.predict(baseline_dummy, verbose=0)
+    hypertuned.predict(hypertuned_dummy, verbose=0)
 
     return baseline, hypertuned, yolo
 
 
-def preprocess_image(image):
-    image = image.resize((IMG_SIZE, IMG_SIZE))
-    image = np.array(image) / 255.0
-    image = np.expand_dims(image, axis=0)
-    return image
-
-
-def predict_cnn(model, image):
-    processed = preprocess_image(image)
-    preds = model.predict(processed)
-    class_idx = np.argmax(preds)
-    confidence = np.max(preds)
-    return CLASS_NAMES[class_idx], confidence
-
-def predict_yolo(model, image):
-    results = model(image)
-    if len(results[0].boxes) == 0:
-        return "No defect detected", 0.0
-    
-    cls = int(results[0].boxes.cls[0])
-    conf = float(results[0].boxes.conf[0])
-    
-    return model.names[cls], conf
+baseline_model, hypertuned_model, yolo_model = load_models()
 
 # =========================
-# UI DESIGN
+# PREPROCESSING
+# =========================
+def preprocess_image(image, img_size):
+    image = image.resize((img_size, img_size))
+    image = np.asarray(image, dtype=np.float32) / 255.0
+    return np.expand_dims(image, axis=0)
+
+# =========================
+# CNN PREDICTION (FIXED FOR SIGMOID)
+# =========================
+def predict_cnn(model, image, img_size):
+    processed = preprocess_image(image, img_size)
+    preds = model.predict(processed, verbose=0)
+
+    prob = float(preds[0][0])  # sigmoid output
+
+    # IMPORTANT: correct interpretation
+    if prob >= 0.5:
+        label = "good"
+        confidence = prob
+    else:
+        label = "defective"
+        confidence = 1 - prob
+
+    return label, confidence
+
+# =========================
+# YOLO PREDICTION
+# =========================
+def predict_yolo(model, image):
+    results = model(image)
+
+    probs = results[0].probs
+
+    if probs is None:
+        return "No prediction", 0.0, results
+
+    class_id = int(probs.top1)
+    confidence = float(probs.top1conf)
+
+    return model.names[class_id], confidence, results
+
+# =========================
+# UI
 # =========================
 st.set_page_config(page_title="Tire Defect Classifier", layout="centered")
 
@@ -58,13 +98,11 @@ st.markdown("""
     <p style='text-align: center;'>Upload an image and choose a model to classify tire defects</p>
 """, unsafe_allow_html=True)
 
-# MODEL SELECTION
 model_choice = st.selectbox(
     "Choose Model",
     ["YOLOv8", "Baseline CNN", "HyperTuned CNN"]
 )
 
-# IMAGE UPLOAD
 uploaded_file = st.file_uploader(
     "Upload Tire Image",
     type=["jpg", "jpeg", "png"]
@@ -72,21 +110,19 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
-
     st.image(image, caption="Uploaded Image", use_container_width=True)
 
-    # PREDICT BUTTON
     if st.button("🔍 Predict"):
         with st.spinner("Analyzing..."):
 
             if model_choice == "Baseline CNN":
-                label, conf = predict_cnn(baseline_model, image)
+                label, conf = predict_cnn(baseline_model, image, BASELINE_SIZE)
 
             elif model_choice == "HyperTuned CNN":
-                label, conf = predict_cnn(hypertuned_model, image)
+                label, conf = predict_cnn(hypertuned_model, image, HYPERTUNED_SIZE)
 
-            else:  # YOLO
-                label, conf = predict_yolo(yolo_model, image)
+            else:
+                label, conf, results = predict_yolo(yolo_model, image)
 
         # =========================
         # OUTPUT
@@ -101,13 +137,14 @@ if uploaded_file:
         with col2:
             st.metric("Confidence", f"{conf:.2%}")
 
-        # Optional: YOLO visualization
+        # YOLO visualization
         if model_choice == "YOLOv8":
-            results = yolo_model(image)
             annotated = results[0].plot()
             st.image(annotated, caption="Detection Result", use_container_width=True)
 
+# =========================
 # FOOTER
+# =========================
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center;'>Built with Streamlit</p>",
