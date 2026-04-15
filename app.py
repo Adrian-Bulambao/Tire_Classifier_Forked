@@ -1,6 +1,5 @@
 import streamlit as st
 import numpy as np
-import cv2
 from PIL import Image
 import tensorflow as tf
 from ultralytics import YOLO
